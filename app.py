@@ -16,10 +16,6 @@ from mimetypes import guess_type
 
 # Load environment variables from .env file
 load_dotenv()
-print("Loaded ENV:")
-print("SUPABASE_URL:", os.environ.get("SUPABASE_URL"))
-print("SMTP_USER:", os.environ.get("SMTP_USER"))
-
 
 # Import your NLP processing modules (assuming these exist)
 # Ensure these modules are available in your Render environment
@@ -78,31 +74,71 @@ def generate_otp():
 
 
 def send_otp_email(to_email, otp):
-    msg = EmailMessage()
-    msg['Subject'] = 'Your OTP for Resume Screening'
-    msg['From'] = os.environ.get("SMTP_USER", 'your_email@gmail.com')  # Use environment variable
-    msg['To'] = to_email
-    msg.set_content(f'Your OTP is: {otp}')
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
 
-    smtp_server = 'smtp.gmail.com'
-    smtp_port = 587
-    smtp_user = os.environ.get("SMTP_USER", 'your_email@gmail.com')  # Use environment variable
-    smtp_pass = os.environ.get("SMTP_PASS", 'your_app_password')  # Use environment variable
+    sender_email = os.environ.get("SMTP_USER", 'your_email@gmail.com')
+    sender_pass = os.environ.get("SMTP_PASS", 'your_app_password')
 
-    if not smtp_user or not smtp_pass:
+    if not sender_email or not sender_pass:
         print("SMTP_USER or SMTP_PASS environment variables not set. Email sending skipped.")
         return
 
+    # Create message
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "🔐 Your OTP for Resume Screening Verification"
+    msg["From"] = sender_email
+    msg["To"] = to_email
+
+    # Plain text fallback
+    text = f"""\
+Hi,
+
+Your OTP for Resume Screening verification is: {otp}
+
+This OTP is valid for 10 minutes. Do not share it with anyone.
+
+If you did not request this, please ignore this email.
+
+Thanks,
+Resume Screening Team
+"""
+
+    # HTML version
+    html = f"""\
+<html>
+  <body style="font-family: Arial, sans-serif; background-color: #f9f9f9; padding: 20px;">
+    <div style="max-width: 600px; margin: auto; background-color: #ffffff; border-radius: 8px; padding: 30px; box-shadow: 0px 0px 10px rgba(0,0,0,0.1);">
+      <h2 style="color: #2e86de;">🔐 Resume Screening OTP Verification</h2>
+      <p>Hi there,</p>
+      <p>Your One-Time Password (OTP) for verifying your email address is:</p>
+      <h1 style="color: #27ae60; letter-spacing: 4px;">{otp}</h1>
+      <p>This OTP is valid for <strong>10 minutes</strong>. Please do not share it with anyone.</p>
+      <hr style="margin: 30px 0;">
+      <p style="font-size: 0.9em; color: #888888;">
+        If you did not request this email, you can safely ignore it.<br>
+        Need help? Contact us at <a href="mailto:nitin.renusharmafoundation@gmail.com">nitin.renusharmafoundation@gmail.com</a>
+      </p>
+      <p style="font-size: 0.9em; color: #888888;">Thanks,<br>The Resume Screening Team</p>
+    </div>
+  </body>
+</html>
+"""
+
+    # Attach plain and HTML parts
+    part1 = MIMEText(text, "plain")
+    part2 = MIMEText(html, "html")
+    msg.attach(part1)
+    msg.attach(part2)
+
     try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
-            server.login(smtp_user, smtp_pass)
+            server.login(sender_email, sender_pass)
             server.send_message(msg)
-        print(f"OTP sent to {to_email}")
+        print(f"✅ OTP sent to {to_email}")
     except Exception as e:
-        print(f"Failed to send OTP email to {to_email}: {e}")
-        # In a real application, you might want to log this error more robustly
-        # and potentially notify an administrator.
+        print(f"❌ Failed to send OTP email to {to_email}: {e}")
 
 
 # --- API Endpoints ---
@@ -149,9 +185,7 @@ def signup():
             'is_verified': False
         }
 
-        print("📤 Inserting into Supabase:", insert_data)
         response = supabase.table('users').insert(insert_data).execute()
-        print("📥 Supabase insert response:", response)
 
         if response.data:
             user_id = response.data[0]['id']
@@ -479,11 +513,11 @@ def screen_resumes():
             'resume_id': resume_id,
             'filename': resume_data['filename'],
             'filepath': resume_data['filepath'],
-            'raw_text': resume_data['raw_text'], # Include raw text for view
+            'raw_text': resume_data['raw_text'],  # Include raw text for view
             'match_score': final_score,
             'matched_skills': matched_skills,
-            'department': required_department, # Include department in results for display
-            'categorized_field': resume_categorized_field # Include categorized field
+            'department': required_department,  # Include department in results for display
+            'categorized_field': resume_categorized_field  # Include categorized field
         }
         results.append(screening_results_db[resume_id])
         # --- DEBUGGING STEP 5 ---
@@ -510,7 +544,7 @@ def get_dashboard_data():
             'matchScore': res['match_score'],
             'matchedSkills': res['matched_skills'],
             'department': res.get('department', 'N/A'),
-            'categorizedField': res.get('categorized_field', 'Uncategorized'), # New field
+            'category': res.get('categorized_field', 'Uncategorized'),
             'shortlisted': False
         })
 
