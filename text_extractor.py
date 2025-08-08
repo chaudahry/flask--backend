@@ -31,5 +31,5 @@ def extract_text_from_file(filepath):
     elif file_extension == '.docx':
         return extract_text_from_docx(filepath)
     else:
-        return "" # Or raise an error for unsupported types
+        raise ValueError(f"Unsupported file type: {file_extension}")
 

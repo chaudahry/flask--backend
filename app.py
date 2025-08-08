@@ -11,11 +11,27 @@ import smtplib
 import random
 from email.message import EmailMessage
 from dotenv import load_dotenv # Import load_dotenv
-from supabase import create_client, Client # Import Supabase client
+
+# Import Appwrite client
+from appwrite.client import Client
+from appwrite.services.users import Users
+from appwrite.services.databases import Databases
+from appwrite.services.storage import Storage
+from appwrite.query import Query
+from appwrite.exception import AppwriteException
+from appwrite.input_file import InputFile
+
+
+
 from mimetypes import guess_type
 
 # Load environment variables from .env file
 load_dotenv()
+print("Loaded ENV:")
+print("APPWRITE_ENDPOINT:", os.environ.get("APPWRITE_ENDPOINT"))
+print("APPWRITE_PROJECT_ID:", os.environ.get("APPWRITE_PROJECT_ID"))
+print("SMTP_USER:", os.environ.get("SMTP_USER"))
+
 
 # Import your NLP processing modules (assuming these exist)
 # Ensure these modules are available in your Render environment
@@ -28,31 +44,42 @@ from resume_matcher import calculate_match_score_enhanced
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
-# --- Database (Supabase Integration) ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# --- Database (Appwrite Integration) ---
+APPWRITE_ENDPOINT = os.environ.get("APPWRITE_ENDPOINT")
+APPWRITE_PROJECT_ID = os.environ.get("APPWRITE_PROJECT_ID")
+APPWRITE_API_KEY = os.environ.get("APPWRITE_API_KEY") # For server-side operations
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    # For local development, you might want to print a warning instead of raising an error
-    # raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set.")
-    print("WARNING: SUPABASE_URL and SUPABASE_KEY environment variables are not set. Supabase features will not work.")
-    # Set dummy values for local testing if you don't have Supabase set up
-    SUPABASE_URL = "http://localhost:8000"
-    SUPABASE_KEY = "dummy_key"
-
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print(f"Could not connect to Supabase: {e}. Supabase features will be disabled.")
-    supabase = None # Disable Supabase if connection fails
+APPWRITE_DATABASE_ID = os.environ.get("APPWRITE_DATABASE_ID")
+APPWRITE_COLLECTION_USERS_ID = os.environ.get("APPWRITE_COLLECTION_USERS_ID")
+APPWRITE_COLLECTION_JOB_REQUIREMENTS_ID = os.environ.get("APPWRITE_COLLECTION_JOB_REQUIREMENTS_ID")
+APPWRITE_COLLECTION_RESUMES_ID = os.environ.get("APPWRITE_COLLECTION_RESUMES_ID")
+APPWRITE_COLLECTION_SCREENING_RESULTS_ID = os.environ.get("APPWRITE_COLLECTION_SCREENING_RESULTS_ID")
+APPWRITE_BUCKET_RESUMES_ID = os.environ.get("APPWRITE_BUCKET_RESUMES_ID")
 
 
-# In-memory dbs for temporary session data
-resumes_db = {}  # Stores processed resume data and original file path
-screening_results_db = {}  # Stores results of the *last* screening operation
-job_requirements_db = {} # Stores job requirements temporarily for the current session
+appwrite_client = None
+appwrite_users = None
+appwrite_databases = None
+appwrite_storage = None
 
-# --- Configuration ---
+if not APPWRITE_ENDPOINT or not APPWRITE_PROJECT_ID or not APPWRITE_API_KEY:
+    print("WARNING: Appwrite environment variables are not fully set. Appwrite features will not work.")
+else:
+    try:
+        appwrite_client = Client()
+        appwrite_client.set_endpoint(APPWRITE_ENDPOINT) \
+                       .set_project(APPWRITE_PROJECT_ID) \
+                       .set_key(APPWRITE_API_KEY)
+
+        appwrite_users = Users(appwrite_client)
+        appwrite_databases = Databases(appwrite_client)
+        appwrite_storage = Storage(appwrite_client)
+
+    except Exception as e:
+        print(f"Could not connect to Appwrite: {e}. Appwrite features will be disabled.")
+        appwrite_client = None # Disable Appwrite if connection fails
+
+
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
@@ -153,51 +180,76 @@ def signup():
     if not email or not password:
         return jsonify({"message": "Email and password are required"}), 400
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. Signup is unavailable."}), 500
 
     try:
-        # Check if user already exists in Supabase 'users' table
-        response = supabase.table('users').select('id', 'is_verified').eq('email', email).execute()
-        existing_user = response.data[0] if response.data else None
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        existing_user_doc = response['documents'][0] if response['documents'] else None
 
-        if existing_user:
-            if existing_user.get('is_verified'):
+        if existing_user_doc:
+            if existing_user_doc.get('is_verified'):
                 return jsonify({"message": "User with this email already exists and is verified"}), 409
             else:
                 # User exists but not verified, resend OTP
                 otp = generate_otp()
-                # Update OTP in Supabase
-                supabase.table('users').update({'otp': otp}).eq('email', email).execute()
+                # Update OTP in Appwrite database document
+                appwrite_databases.update_document(
+                    database_id=APPWRITE_DATABASE_ID,
+                    collection_id=APPWRITE_COLLECTION_USERS_ID,
+                    document_id=existing_user_doc['$id'],
+                    data={'otp': otp}
+                )
                 send_otp_email(email, otp)
                 return jsonify(
-                    {"message": "User exists but not verified. OTP resent for email verification.", "user_id": existing_user['id']}), 200
+                    {"message": "User exists but not verified. OTP resent for email verification.", "user_id": existing_user_doc['$id']}), 200
 
         hashed_password = generate_password_hash(password)
         otp = generate_otp()
 
-        # Insert new user into Supabase 'users' table
+        appwrite_user_account = appwrite_users.create(
+            user_id=generate_id(),
+            email=email,
+            password=password,
+            phone=phone
+        )
+
         insert_data = {
             'email': email,
             'phone': phone,
-            'password_hash': hashed_password,
+            'password_hash': hashed_password, # Store hashed password for verification later
             'otp': otp,
-            'is_verified': False
+            'is_verified': False,
+            'appwrite_account_id': appwrite_user_account['$id'] # Link to Appwrite Auth user ID
         }
 
-        response = supabase.table('users').insert(insert_data).execute()
+        new_user_doc = appwrite_databases.create_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=generate_id(), # Document ID for the profile data
+            data=insert_data
+        )
 
-        if response.data:
-            user_id = response.data[0]['id']
-            print(f"User {email} registered with ID {user_id} in Supabase.")
+        if new_user_doc:
+            user_id = new_user_doc['$id']
+            print(f"User {email} registered with ID {user_id} in Appwrite.")
             send_otp_email(email, otp)
             return jsonify({"message": "User registered successfully. OTP sent for email verification.", "user_id": user_id}), 201
         else:
             return jsonify({"message": "Failed to register user."}), 500
 
+    except AppwriteException as e:
+        print(f"Appwrite signup error: {e.message}")
+        if "A user with the same email already exists" in e.message:
+            return jsonify({"message": "User with this email already exists."}), 409
+        return jsonify({"message": f"An Appwrite error occurred during signup: {e.message}"}), 500
     except Exception as e:
         import traceback
-        print(f"Supabase signup error: {e}")
+        print(f"General signup error: {e}")
         traceback.print_exc()
         return jsonify({"message": f"An error occurred during signup: {str(e)}"}), 500
 
@@ -211,37 +263,50 @@ def login():
     if not email or not password:
         return jsonify({"message": "Email and password are required"}), 400
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. Login is unavailable."}), 500
 
     try:
-        response = supabase.table('users').select('*').eq('email', email).execute()
-        user = response.data[0] if response.data else None
+        # Fetch user document from Appwrite database
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        user_doc = response['documents'][0] if response['documents'] else None
 
-        if not user or not check_password_hash(user['password_hash'], password):
+        if not user_doc or not check_password_hash(user_doc['password_hash'], password):
             return jsonify({"message": "Invalid email or password"}), 401
 
-        if not user.get('is_verified'):
+        if not user_doc.get('is_verified'):
             return jsonify({"message": "Please verify your email via OTP first."}), 403
 
-        # Clear OTP from Supabase after successful login (if it was still there)
-        supabase.table('users').update({'otp': None}).eq('email', email).execute()
+        # Clear OTP from Appwrite after successful login
+        appwrite_databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=user_doc['$id'],
+            data={'otp': None}
+        )
 
-        role_set = user.get('role') is not None
+        role_set = user_doc.get('role') is not None
         return jsonify({
             "message": "Login successful",
-            "user_id": user['id'],
+            "user_id": user_doc['$id'],
             "role_set": role_set,
-            "email": user['email'],
-            "name": user.get('full_name', user['email'].split('@')[0]), # Pass full_name if available
-            "hr_id": user.get('hr_id'),
-            "role": user.get('role'),
-            "department": user.get('department'),
-            "position": user.get('position')
+            "email": user_doc['email'],
+            "name": user_doc.get('full_name', user_doc['email'].split('@')[0]),
+            "hr_id": user_doc.get('hr_id'),
+            "role": user_doc.get('role'),
+            "department": user_doc.get('department'),
+            "position": user_doc.get('position')
         }), 200
 
+    except AppwriteException as e:
+        print(f"Appwrite login error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during login: {e.message}"}), 500
     except Exception as e:
-        print(f"Supabase login error: {e}")
+        print(f"General login error: {e}")
         return jsonify({"message": f"An error occurred during login: {str(e)}"}), 500
 
 
@@ -252,43 +317,59 @@ def verify_otp():
     otp = data.get('otp')
     action = data.get('action', 'signup')
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. OTP verification is unavailable."}), 500
 
     try:
-        response = supabase.table('users').select('id', 'otp', 'is_verified', 'role', 'full_name', 'hr_id', 'department', 'position').eq('email', email).execute()
-        user = response.data[0] if response.data else None
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        user_doc = response['documents'][0] if response['documents'] else None
 
-        if not user or user['otp'] != otp:
+        if not user_doc or user_doc['otp'] != otp:
             return jsonify({"message": "Invalid OTP"}), 401
 
-        # Clear OTP and update verification status in Supabase
+        # Clear OTP and update verification status in Appwrite
         update_data = {'otp': None}
         if action == 'signup':
             update_data['is_verified'] = True
+            # Also update the Appwrite Auth user's email verification status
+            if user_doc.get('appwrite_account_id'):
+                appwrite_users.update_email_verification(user_doc['appwrite_account_id'], True)
 
-        supabase.table('users').update(update_data).eq('email', email).execute()
+
+        appwrite_databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=user_doc['$id'],
+            data=update_data
+        )
 
         if action == 'signup':
-            role_set = user.get('role') is not None
+            role_set = user_doc.get('role') is not None
             return jsonify({
                 "message": "Email verified and login successful",
-                "user_id": user['id'],
+                "user_id": user_doc['$id'],
                 "role_set": role_set,
                 "email": email,
-                "name": user.get('full_name', email.split('@')[0]),
-                "hr_id": user.get('hr_id'),
-                "role": user.get('role'),
-                "department": user.get('department'),
-                "position": user.get('position')
+                "name": user_doc.get('full_name', email.split('@')[0]),
+                "hr_id": user_doc.get('hr_id'),
+                "role": user_doc.get('role'),
+                "department": user_doc.get('department'),
+                "position": user_doc.get('position')
             }), 200
         elif action == 'reset_password':
-            return jsonify({"message": "OTP verified. You can now reset your password.", "user_id": user['id']}), 200
+            return jsonify({"message": "OTP verified. You can now reset your password.", "user_id": user_doc['$id']}), 200
         else:
             return jsonify({"message": "Invalid action for OTP verification"}), 400
 
+    except AppwriteException as e:
+        print(f"Appwrite OTP verification error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during OTP verification: {e.message}"}), 500
     except Exception as e:
-        print(f"Supabase OTP verification error: {e}")
+        print(f"General OTP verification error: {e}")
         return jsonify({"message": f"An error occurred during OTP verification: {str(e)}"}), 500
 
 
@@ -297,26 +378,38 @@ def forgot_password():
     data = request.json
     email = data.get('email')
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. Forgot password is unavailable."}), 500
 
     try:
-        response = supabase.table('users').select('id').eq('email', email).execute()
-        user = response.data[0] if response.data else None
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        user_doc = response['documents'][0] if response['documents'] else None
 
-        if not user:
+        if not user_doc:
             return jsonify({"message": "User not found"}), 404
 
         otp = generate_otp()
-        # Store OTP in Supabase for the user
-        supabase.table('users').update({'otp': otp}).eq('email', email).execute()
+        # Store OTP in Appwrite for the user
+        appwrite_databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=user_doc['$id'],
+            data={'otp': otp}
+        )
 
         send_otp_email(email, otp)
         print(f"Demo OTP for password reset for {email}: {otp}")
         return jsonify({"message": "OTP sent to your email for password reset"}), 200
 
+    except AppwriteException as e:
+        print(f"Appwrite forgot password error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during forgot password: {e.message}"}), 500
     except Exception as e:
-        print(f"Supabase forgot password error: {e}")
+        print(f"General forgot password error: {e}")
         return jsonify({"message": f"An error occurred during forgot password: {str(e)}"}), 500
 
 
@@ -326,24 +419,40 @@ def reset_password():
     email = data.get('email')
     new_password = data.get('new_password')
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. Password reset is unavailable."}), 500
 
     try:
-        response = supabase.table('users').select('id').eq('email', email).execute()
-        user = response.data[0] if response.data else None
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        user_doc = response['documents'][0] if response['documents'] else None
 
-        if not user:
+        if not user_doc:
             return jsonify({"message": "User not found"}), 404
 
         hashed_new_password = generate_password_hash(new_password)
-        # Update password_hash in Supabase
-        supabase.table('users').update({'password_hash': hashed_new_password, 'otp': None}).eq('email', email).execute()
+        # Update password_hash in Appwrite
+        appwrite_databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=user_doc['$id'],
+            data={'password_hash': hashed_new_password, 'otp': None}
+        )
+        # Also update the password in Appwrite Auth if linked
+        if user_doc.get('appwrite_account_id'):
+            appwrite_users.update_password(user_doc['appwrite_account_id'], new_password)
+
 
         return jsonify({"message": "Password reset successfully"}), 200
 
+    except AppwriteException as e:
+        print(f"Appwrite reset password error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during password reset: {e.message}"}), 500
     except Exception as e:
-        print(f"Supabase reset password error: {e}")
+        print(f"General reset password error: {e}")
         return jsonify({"message": f"An error occurred during password reset: {str(e)}"}), 500
 
 
@@ -360,11 +469,21 @@ def select_role():
     if not email:
         return jsonify({"message": "User ID is required"}), 400
 
-    if not supabase:
+    if not appwrite_client:
         return jsonify({"message": "Database not connected. Role selection is unavailable."}), 500
 
     try:
-        # Update user's details in Supabase 'users' table
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            queries=[Query.equal('email', email)]
+        )
+        user_doc = response['documents'][0] if response['documents'] else None
+
+        if not user_doc:
+            return jsonify({"message": "User not found"}), 404
+
+        # Update user's details in Appwrite 'users' collection
         update_data = {
             'role': role,
             'hr_id': hr_id,
@@ -372,15 +491,23 @@ def select_role():
             'position': position,
             'department': department
         }
-        response = supabase.table('users').update(update_data).eq('email', email).execute()
+        updated_doc = appwrite_databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_USERS_ID,
+            document_id=user_doc['$id'],
+            data=update_data
+        )
 
-        if response.data:
+        if updated_doc:
             return jsonify({"message": f"Role '{role}' and HR info updated for {email}"}), 200
         else:
             return jsonify({"message": "User not found or failed to update"}), 404
 
+    except AppwriteException as e:
+        print(f"Appwrite select role error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during role selection: {e.message}"}), 500
     except Exception as e:
-        print(f"Supabase select role error: {e}")
+        print(f"General select role error: {e}")
         return jsonify({"message": f"An error occurred during role selection: {str(e)}"}), 500
 
 
@@ -391,24 +518,38 @@ def save_job_requirements():
     job_description = data.get('job_description')
     department = data.get('department')
     skills = data.get('skills')
-    experience_required = data.get('experience_required') # New field
+    experience_required = data.get('experience_required')
 
     if not user_id or not job_description or not skills:
         return jsonify({"message": "User ID, job description, and skills are required"}), 400
 
-    # Generate a unique ID for this set of job requirements
-    job_id = generate_id()
+    if not appwrite_client:
+        return jsonify({"message": "Database not connected. Job requirements saving is unavailable."}), 500
 
-    # Store job requirements in-memory for temporary use
-    job_requirements_db[job_id] = {
-        'user_id': user_id,
-        'job_description': job_description,
-        'department': department,
-        'skills': skills,
-        'experience_required': experience_required # Store new field
-    }
-    print(f"Job requirements saved in-memory with ID: {job_id}")
-    return jsonify({"message": "Job requirements saved temporarily", "job_id": job_id}), 201
+    try:
+        job_id = generate_id()
+        insert_data = {
+            'user_id': user_id,
+            'job_description': job_description,
+            'department': department,
+            'skills': skills,
+            'experience_required': experience_required
+        }
+        new_job_req_doc = appwrite_databases.create_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_JOB_REQUIREMENTS_ID,
+            document_id=job_id, # Use generated ID as document ID
+            data=insert_data
+        )
+        print(f"Job requirements saved in Appwrite with ID: {job_id}")
+        return jsonify({"message": "Job requirements saved", "job_id": job_id}), 201
+
+    except AppwriteException as e:
+        print(f"Appwrite save job requirements error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred: {e.message}"}), 500
+    except Exception as e:
+        print(f"General save job requirements error: {e}")
+        return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 
 @app.route('/api/upload_resumes', methods=['POST'])
@@ -419,33 +560,71 @@ def upload_resumes():
     files = request.files.getlist('files')
     uploaded_resume_ids = []
 
+    if not appwrite_client:
+        return jsonify({"message": "Database or Storage not connected. Resume upload is unavailable."}), 500
+
     for file in files:
         if file.filename == '':
             continue
 
         original_filename = file.filename
-        unique_filename = f"{uuid.uuid4()}_{original_filename}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        file.save(filepath)
+        file_extension = os.path.splitext(original_filename)[1]
+        appwrite_file_id = str(uuid.uuid4())
+        unique_local_filename = f"{appwrite_file_id}{file_extension}"
+        filepath_local = os.path.join(app.config['UPLOAD_FOLDER'], unique_local_filename)
 
-        raw_text = extract_text_from_file(filepath)
-        processed_text = preprocess_text(raw_text)
-        extracted_skills = extract_skills_from_text(processed_text)
-        categorized_field = categorize_resume(processed_text) # New categorization
+        file.save(filepath_local)
 
-        resume_id = generate_id()
-        resumes_db[resume_id] = {
-            'filename': original_filename,
-            'filepath': unique_filename,
-            'raw_text': raw_text,
-            'processed_text': processed_text,
-            'extracted_skills': extracted_skills,
-            'categorized_field': categorized_field # Store new field
-        }
-        uploaded_resume_ids.append(resume_id)
+        try:
+            input_file = InputFile.from_path(filepath_local)
+
+            appwrite_file = appwrite_storage.create_file(
+                bucket_id=APPWRITE_BUCKET_RESUMES_ID,
+                file_id=appwrite_file_id,
+                file=input_file
+            )
+
+            file_storage_id = appwrite_file['$id']
+            file_storage_path = f"{APPWRITE_ENDPOINT}/storage/buckets/{APPWRITE_BUCKET_RESUMES_ID}/files/{file_storage_id}/view?project={APPWRITE_PROJECT_ID}"
+
+            raw_text = extract_text_from_file(filepath_local)
+            processed_text = preprocess_text(raw_text)
+            extracted_skills = extract_skills_from_text(processed_text)
+            categorized_field = categorize_resume(processed_text)
+
+            resume_id = generate_id()
+            insert_data = {
+                'filename': original_filename,
+                'filepath': file_storage_path,
+                'appwrite_file_id': file_storage_id,
+                'raw_text': raw_text,
+                'processed_text': processed_text,
+                'extracted_skills': extracted_skills,
+                'categorized_field': categorized_field
+            }
+            new_resume_doc = appwrite_databases.create_document(
+                database_id=APPWRITE_DATABASE_ID,
+                collection_id=APPWRITE_COLLECTION_RESUMES_ID,
+                document_id=resume_id,
+                data=insert_data
+            )
+            uploaded_resume_ids.append(resume_id)
+
+        except AppwriteException as e:
+            print(f"Appwrite upload resume error for {original_filename}: {e.message}")
+            if os.path.exists(filepath_local):
+                os.remove(filepath_local)
+            return jsonify({"message": f"Failed to upload {original_filename}: {e.message}"}), 500
+        except Exception as e:
+            print(f"General upload resume error for {original_filename}: {e}")
+            if os.path.exists(filepath_local):
+                os.remove(filepath_local)
+            return jsonify({"message": f"An error occurred processing {original_filename}: {str(e)}"}), 500
+        finally:
+            if os.path.exists(filepath_local):
+                os.remove(filepath_local)
 
     return jsonify({"message": "Resumes uploaded and processed", "resume_ids": uploaded_resume_ids}), 200
-
 
 @app.route('/api/screen_resumes', methods=['POST'])
 def screen_resumes():
@@ -453,119 +632,179 @@ def screen_resumes():
     job_id = data.get('job_id')
     resume_ids = data.get('resume_ids')
 
-    # --- DEBUGGING STEP 1 ---
-    #print(f"--- Screening Resumes for Job ID: {job_id} ---")
-    #print(f"Received Resume IDs: {resume_ids}")
-    #print(f"Current Resumes in DB: {list(resumes_db.keys())}")
-    # -------------------------
+    if not appwrite_client:
+        return jsonify({"message": "Database not connected. Screening is unavailable."}), 500
 
-    # Fetch job requirements from in-memory storage
-    job_req = job_requirements_db.get(job_id)
-
-    if not job_req:
-        return jsonify({"message": "Job requirements not found or session expired. Please re-enter job details."}), 404
-
-    job_description_text = job_req['job_description']
-    required_skills = job_req['skills']
-    required_department = job_req['department']
-    experience_required = job_req['experience_required'] # New field
-
-    results = []
-    screening_results_db.clear() # Clear previous screening results
-
-    for resume_id in resume_ids:
-        if resume_id not in resumes_db:
-            # --- DEBUGGING STEP 2 ---
-            #print(f"WARNING: Resume ID {resume_id} not found in resumes_db. Skipping.")
-            # -------------------------
-            continue
-
-        resume_data = resumes_db[resume_id]
-        resume_processed_text = resume_data['processed_text']
-        resume_extracted_skills = resume_data['extracted_skills']
-        resume_categorized_field = resume_data['categorized_field'] # New field
-        # --- DEBUGGING STEP 3 ---
-        #print(f"Processing Resume: {resume_data.get('filename')}")
-        # -------------------------
-
-        # Call the enhanced match score function
-        match_score, matched_skills = calculate_match_score_enhanced(
-            job_description_text,
-            required_skills,
-            experience_required, # Pass new field
-            resume_processed_text,
-            resume_extracted_skills,
-            HF_API_KEY # Pass Hugging Face API Key
+    try:
+        # Fetch job requirements from Appwrite
+        job_req_doc = appwrite_databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_JOB_REQUIREMENTS_ID,
+            document_id=job_id
         )
 
-        department_match_factor = 1.0
-        # Check if required_department is present in the resume's processed text
-        if required_department and required_department.lower() in resume_processed_text.lower():
-            department_match_factor = 1.05 # Apply a small boost for department match
+        if not job_req_doc:
+            return jsonify({"message": "Job requirements not found or session expired. Please re-enter job details."}), 404
 
-        final_score = int(match_score * department_match_factor)
-        final_score = min(final_score, 100) # Cap score at 100
-        # --- DEBUGGING STEP 4 ---
-        #print(f"Calculated Score for {resume_data.get('filename')}: {final_score}")
-        # -------------------------
-        screening_results_db[resume_id] = {
-            'job_id': job_id,
-            'resume_id': resume_id,
-            'filename': resume_data['filename'],
-            'filepath': resume_data['filepath'],
-            'raw_text': resume_data['raw_text'],  # Include raw text for view
-            'match_score': final_score,
-            'matched_skills': matched_skills,
-            'department': required_department,  # Include department in results for display
-            'categorized_field': resume_categorized_field  # Include categorized field
-        }
-        results.append(screening_results_db[resume_id])
-        # --- DEBUGGING STEP 5 ---
-        #print(f"--- Final Screening Results to be Sent: {results} ---")
-        # -------------------------
-    return jsonify({"message": "Screening complete", "results": results}), 200
+        job_description_text = job_req_doc['job_description']
+        required_skills = job_req_doc['skills']
+        required_department = job_req_doc['department']
+        experience_required = job_req_doc['experience_required']
+
+        results = []
+        # REMOVED: Redundant in-memory cache logic
+        # screening_results_db.clear()
+
+        for resume_id in resume_ids:
+            try:
+                resume_data_doc = appwrite_databases.get_document(
+                    database_id=APPWRITE_DATABASE_ID,
+                    collection_id=APPWRITE_COLLECTION_RESUMES_ID,
+                    document_id=resume_id
+                )
+            except AppwriteException as e:
+                print(f"Resume ID {resume_id} not found in Appwrite: {e.message}. Skipping.")
+                continue
+
+            resume_processed_text = resume_data_doc['processed_text']
+            resume_extracted_skills = resume_data_doc['extracted_skills']
+            resume_categorized_field = resume_data_doc['categorized_field']
+
+            # Call the enhanced match score function
+            match_score, matched_skills = calculate_match_score_enhanced(
+                job_description_text,
+                required_skills,
+                experience_required,
+                resume_processed_text,
+                resume_extracted_skills,
+                HF_API_KEY
+            )
+
+            department_match_factor = 1.0
+            if required_department and required_department.lower() in resume_processed_text.lower():
+                department_match_factor = 1.05
+
+            final_score = int(match_score * department_match_factor)
+            final_score = min(final_score, 100)
+
+            # Store screening result in Appwrite
+            screening_result_doc_id = generate_id()
+            screening_result_data = {
+                'job_id': job_id,
+                'resume_id': resume_id,
+                'filename': resume_data_doc['filename'],
+                'filepath': resume_data_doc['filepath'],
+                'appwrite_file_id': resume_data_doc['appwrite_file_id'],
+                'raw_text': resume_data_doc['raw_text'],
+                'match_score': final_score,
+                'matched_skills': matched_skills,
+                'department': required_department,
+                'categorized_field': resume_categorized_field
+            }
+            new_screening_result_doc = appwrite_databases.create_document(
+                database_id=APPWRITE_DATABASE_ID,
+                collection_id=APPWRITE_COLLECTION_SCREENING_RESULTS_ID,
+                document_id=screening_result_doc_id,
+                data=screening_result_data
+            )
+            # REMOVED: Redundant in-memory cache logic
+            # screening_results_db[resume_id] = new_screening_result_doc
+            results.append(new_screening_result_doc)
+
+        return jsonify({"message": "Screening complete", "results": results}), 200
+
+    except AppwriteException as e:
+        print(f"Appwrite screen resumes error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred during screening: {e.message}"}), 500
+    except Exception as e:
+        print(f"General screen resumes error: {e}")
+        return jsonify({"message": f"An error occurred during screening: {str(e)}"}), 500
 
 
+# MODIFIED: This endpoint now fetches directly from Appwrite
 @app.route('/api/dashboard_data', methods=['GET'])
 def get_dashboard_data():
-    results = list(screening_results_db.values())
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({"message": "A job_id is required to fetch dashboard data."}), 400
 
-    sort_by = request.args.get('sort_by', 'score')
-    if sort_by == 'score':
-        results.sort(key=lambda x: x['match_score'], reverse=True)
-    elif sort_by == 'name':
-        results.sort(key=lambda x: x['filename'])
+    if not appwrite_client:
+        return jsonify({"message": "Database not connected."}), 500
 
-    formatted_results = []
-    for res in results:
-        formatted_results.append({
-            'id': res['resume_id'],
-            'name': res['filename'].split('.')[0],
-            'matchScore': res['match_score'],
-            'matchedSkills': res['matched_skills'],
-            'department': res.get('department', 'N/A'),
-            'category': res.get('categorized_field', 'Uncategorized'),
-            'shortlisted': False
-        })
+    try:
+        # NEW: Fetch results directly from Appwrite for the specific job
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_SCREENING_RESULTS_ID,
+            queries=[Query.equal('job_id', job_id)]
+        )
+        results = response['documents']
 
-    return jsonify(formatted_results), 200
+        sort_by = request.args.get('sort_by', 'score')
+        if sort_by == 'score':
+            results.sort(key=lambda x: x['match_score'], reverse=True)
+        elif sort_by == 'name':
+            results.sort(key=lambda x: x['filename'])
+
+        formatted_results = []
+        for res in results:
+            formatted_results.append({
+                'id': res['resume_id'],
+                'name': res['filename'].split('.')[0],
+                'matchScore': res['match_score'],
+                'matchedSkills': res['matched_skills'],
+                'department': res.get('department', 'N/A'),
+                'category': res.get('categorized_field', 'Uncategorized'),
+                'shortlisted': False
+            })
+
+        return jsonify(formatted_results), 200
+
+    except AppwriteException as e:
+        print(f"Appwrite dashboard data error: {e.message}")
+        return jsonify({"message": f"An Appwrite error occurred: {e.message}"}), 500
+    except Exception as e:
+        print(f"General dashboard data error: {e}")
+        return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 
 @app.route('/api/resume/<resume_id>', methods=['GET'])
 def get_resume_raw_text(resume_id):
-    if resume_id in resumes_db:
-        # IMPORTANT: The frontend expects a 'content' field, not 'raw_text'.
-        return jsonify({"content": resumes_db[resume_id]['raw_text']}), 200
-    return jsonify({"message": "Resume not found"}), 404
+    if not appwrite_client:
+        return jsonify({"message": "Database not connected."}), 500
+    try:
+        resume_doc = appwrite_databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_RESUMES_ID,
+            document_id=resume_id
+        )
+        return jsonify({"content": resume_doc['raw_text']}), 200
+    except AppwriteException as e:
+        print(f"Appwrite get resume raw text error: {e.message}")
+        return jsonify({"message": "Resume not found"}), 404
+    except Exception as e:
+        print(f"General get resume raw text error: {e}")
+        return jsonify({"message": f"An error occurred: {str(e)}"}), 500
+
 
 @app.route('/api/download_all_resumes/<job_id>', methods=['GET'])
 def download_all_resumes_for_job(job_id):
-    # This logic assumes you want to download all resumes associated with a screening,
-    # not just the filtered ones.
+    if not appwrite_client:
+        return jsonify({"message": "Database or Storage not connected."}), 500
+
     resumes_to_download = []
-    for resume_id, result in screening_results_db.items():
-        if result['job_id'] == job_id:
-            resumes_to_download.append(result)
+    try:
+        # Fetch all screening results for the given job_id
+        response = appwrite_databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_SCREENING_RESULTS_ID,
+            queries=[Query.equal('job_id', job_id)]
+        )
+        resumes_to_download = response['documents']
+
+    except AppwriteException as e:
+        print(f"Appwrite download all resumes error: {e.message}")
+        return jsonify({"message": f"Error fetching resumes: {e.message}"}), 500
 
     if not resumes_to_download:
         return jsonify({"message": "No resumes found for this job ID."}), 404
@@ -573,13 +812,21 @@ def download_all_resumes_for_job(job_id):
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         for resume_data in resumes_to_download:
-            unique_filename_on_server = resume_data.get('filepath')
             original_filename = resume_data.get('filename')
+            appwrite_file_id = resume_data.get('appwrite_file_id')
 
-            if unique_filename_on_server and original_filename:
-                full_filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename_on_server)
-                if os.path.exists(full_filepath):
-                    zf.write(full_filepath, arcname=original_filename)
+            if appwrite_file_id and original_filename:
+                try:
+                    # Download file from Appwrite Storage
+                    file_bytes = appwrite_storage.get_file_download(
+                        bucket_id=APPWRITE_BUCKET_RESUMES_ID,
+                        file_id=appwrite_file_id
+                    )
+                    zf.writestr(original_filename, file_bytes)
+                except AppwriteException as e:
+                    print(f"Failed to download file {appwrite_file_id} from Appwrite: {e.message}")
+                except Exception as e:
+                    print(f"General error downloading file {appwrite_file_id}: {e}")
 
     memory_file.seek(0)
     response = make_response(memory_file.getvalue())
@@ -590,25 +837,44 @@ def download_all_resumes_for_job(job_id):
 @app.route('/api/download_resume', methods=['POST'])
 def download_resume_file():
     data = request.json
-    unique_filename_on_server = data.get('filepath')
+    resume_id = data.get('resume_id')
 
-    # You can still get the original filename from resumes_db if it exists,
-    # but it's better to get it from the frontend too for statelessness.
-    # For now, let's just use the unique name if original is not available.
-    original_filename = unique_filename_on_server.split('_', 1)[-1]  # A simple way to get original name
+    if not resume_id:
+        return jsonify({"message": "Resume ID is required"}), 400
 
-    if not unique_filename_on_server:
-        return jsonify({"message": "Filepath is required"}), 400
+    if not appwrite_client:
+        return jsonify({"message": "Storage not connected."}), 500
 
-    full_filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename_on_server)
+    try:
+        resume_doc = appwrite_databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=APPWRITE_COLLECTION_RESUMES_ID,
+            document_id=resume_id
+        )
+        appwrite_file_id = resume_doc.get('appwrite_file_id')
+        original_filename = resume_doc.get('filename')
 
-    # Security check: Ensure the file is within the UPLOAD_FOLDER
-    if os.path.exists(full_filepath) and os.path.abspath(os.path.dirname(full_filepath)) == os.path.abspath(
-            app.config['UPLOAD_FOLDER']):
+        if not appwrite_file_id or not original_filename:
+            return jsonify({"message": "File information not found for this resume."}), 404
+
+        file_bytes = appwrite_storage.get_file_download(
+            bucket_id=APPWRITE_BUCKET_RESUMES_ID,
+            file_id=appwrite_file_id
+        )
+
         mimetype, _ = guess_type(original_filename)
-        return send_from_directory(app.config['UPLOAD_FOLDER'], unique_filename_on_server, as_attachment=True,download_name=original_filename, mimetype=mimetype or 'application/octet-stream')
-    else:
-        return jsonify({"message": "File not found on server or invalid path"}), 404
+        response = make_response(file_bytes)
+        response.headers['Content-Type'] = mimetype or 'application/octet-stream'
+        response.headers['Content-Disposition'] = f'attachment; filename="{original_filename}"'
+        return response
+
+    except AppwriteException as e:
+        print(f"Appwrite download resume file error: {e.message}")
+        return jsonify({"message": "File not found or access denied."}), 404
+    except Exception as e:
+        print(f"General download resume file error: {e}")
+        return jsonify({"message": f"An error occurred: {str(e)}"}), 500
+
 
 @app.route('/api/download_all_filtered_resumes', methods=['POST'])
 def download_all_filtered_resumes():
@@ -618,29 +884,33 @@ def download_all_filtered_resumes():
     if not filtered_resume_ids:
         return jsonify({"message": "No filtered resumes to download."}), 404
 
+    if not appwrite_client:
+        return jsonify({"message": "Database or Storage not connected."}), 500
+
     memory_file = BytesIO()
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         for resume_id in filtered_resume_ids:
-            result = screening_results_db.get(resume_id)
-            if result:
-                unique_filename_on_server = result.get('filepath')
-                original_filename = result.get('filename')
+            try:
+                resume_doc = appwrite_databases.get_document(
+                    database_id=APPWRITE_DATABASE_ID,
+                    collection_id=APPWRITE_COLLECTION_RESUMES_ID,
+                    document_id=resume_id
+                )
+                appwrite_file_id = resume_doc.get('appwrite_file_id')
+                original_filename = resume_doc.get('filename')
 
-                if unique_filename_on_server and original_filename:
-                    full_filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename_on_server)
-                    if os.path.exists(full_filepath):
-                        # Security check: Ensure the file is within the UPLOAD_FOLDER
-                        if os.path.abspath(os.path.dirname(full_filepath)) == os.path.abspath(
-                                app.config['UPLOAD_FOLDER']):
-                            zf.write(full_filepath, arcname=original_filename)
-                        else:
-                            print(f"Skipping file outside UPLOAD_FOLDER: {full_filepath}")
-                    else:
-                        print(f"File not found for resume_id {resume_id}: {full_filepath}")
+                if appwrite_file_id and original_filename:
+                    file_bytes = appwrite_storage.get_file_download(
+                        bucket_id=APPWRITE_BUCKET_RESUMES_ID,
+                        file_id=appwrite_file_id
+                    )
+                    zf.writestr(original_filename, file_bytes)
                 else:
-                    print(f"Missing filename or filepath for resume_id {resume_id}")
-            else:
-                print(f"Resume ID {resume_id} not found in screening results for download.")
+                    print(f"Missing file ID or filename for resume_id {resume_id}")
+            except AppwriteException as e:
+                print(f"Failed to fetch or download resume {resume_id} from Appwrite: {e.message}")
+            except Exception as e:
+                print(f"General error processing filtered resume {resume_id}: {e}")
 
     memory_file.seek(0)
     response = make_response(memory_file.getvalue())
@@ -648,30 +918,15 @@ def download_all_filtered_resumes():
     response.headers['Content-Disposition'] = 'attachment; filename=filtered_resumes.zip'
     return response
 
-@app.route('/api/clear_session_data', methods=['POST'])
-def clear_session_data():
-    global resumes_db, screening_results_db, job_requirements_db
-    resumes_db = {}
-    screening_results_db = {}
-    job_requirements_db = {}
-    print("Backend session data cleared.")
-    return jsonify({"message": "Session data cleared successfully"}), 200
-
-# Catch-all route for email verification success (from previous context)
 @app.route('/success')
 def email_verified_success():
     return '✅ Email verified successfully. You can now return to your app and login.'
 
 @app.route('/<path:path>')
 def catch_all(path):
-    # This route is a fallback and might catch requests for static files if not configured correctly
-    # For Render, ensure static files are served by the web server (e.g., Nginx) or Flask's static handler
     return 'Page not found', 404
 
 
 if __name__ == "__main__":
-    # Use environment variable for PORT, default to 5000
     port = int(os.environ.get("PORT", 5000))
-    # Bind to 0.0.0.0 for Render deployment
     app.run(debug=True, host='0.0.0.0', port=port)
-
